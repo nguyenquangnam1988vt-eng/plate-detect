@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Nhận diện biển số xe - Đọc ký tự</title>
+    <style>
+        body {
+            font-family: system-ui, 'Segoe UI', monospace;
+            background: #0a0f1e;
+            color: #eee;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: #1e2a3a;
+            border-radius: 28px;
+            padding: 20px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            max-width: 800px;
+            width: 100%;
+        }
+        .video-container {
+            position: relative;
+            overflow: hidden;
+            border-radius: 16px;
+            background: black;
+            margin-top: 10px;
+            touch-action: pan-x pan-y; /* cho phép cuộn nhưng không pinch-zoom toàn trang */
+        }
+        video, canvas {
+            width: 100%;
+            height: auto;
+            display: block;
+            transform-origin: 0 0;
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+        .controls {
+            display: flex;
+            gap: 12px;
+            margin: 15px 0;
+            flex-wrap: wrap;
+        }
+        button {
+            background: #2c7da0;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 40px;
+            font-weight: bold;
+            color: white;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        button:disabled {
+            background: #4a6272;
+            cursor: not-allowed;
+        }
+        .result-box {
+            background: #0f1724;
+            padding: 12px 20px;
+            border-radius: 40px;
+            font-size: 1.4rem;
+            text-align: center;
+            letter-spacing: 2px;
+            font-weight: bold;
+            margin-top: 16px;
+            border-left: 6px solid #2c7da0;
+        }
+        .log {
+            background: #0a0f1e;
+            border-radius: 20px;
+            padding: 8px 12px;
+            font-size: 0.75rem;
+            font-family: monospace;
+            height: 120px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+        h2 {
+            margin: 0 0 8px 0;
+            font-size: 1.2rem;
+        }
+        .zoom-info {
+            font-size: 0.8rem;
+            text-align: center;
+            margin-top: 8px;
+            color: #aaa;
+        }
+    </style>
+    <script>
+        window.onOpenCvReady = function() {
+            console.log("✅ OpenCV.js loaded");
+            if (window._cvReadyCallback) window._cvReadyCallback();
+        };
+    </script>
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+    <script src="script.js" defer></script>
+</head>
+<body>
+<div class="container">
+    <h2>📸 Nhận diện biển số & đọc ký tự</h2>
+    <div class="video-container" id="videoContainer">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+    </div>
+    <div class="controls">
+        <button id="startBtn">▶ BẮT ĐẦU QUÉT</button>
+    </div>
+    <div class="result-box" id="resultText">⚡ Chưa nhận diện</div>
+    <div class="zoom-info" id="zoomInfo">📱 Chạm hai ngón để zoom (nếu camera hỗ trợ)</div>
+    <div class="log" id="logBox">📋 Log sẽ hiện tại đây...\n</div>
+</div>
+</body>
+</html>

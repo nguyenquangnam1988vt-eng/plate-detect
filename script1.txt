@@ -1,0 +1,326 @@
+// ==================== KHỞI TẠO ====================
+document.addEventListener("DOMContentLoaded", () => {
+    console.log("🚀 DOM ready");
+
+    // ---------- DOM elements ----------
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const resultDiv = document.getElementById("result");
+    const startBtn = document.getElementById("startBtn");
+    const logBox = document.getElementById("logBox");
+
+    if (!video || !canvas || !resultDiv || !startBtn) {
+        alert("Lỗi: Thiếu element DOM. Kiểm tra lại id.");
+        return;
+    }
+
+    const ctx = canvas.getContext("2d");
+
+    // ---------- Cấu hình tham số ----------
+    const MODEL_PATH = "/model/bienso1.onnx";   // Đường dẫn tương đối từ gốc web
+    const INPUT_SIZE = 640;                     // YOLOv8 yêu cầu 640x640
+    const CONF_THRESHOLD = 0.6;                // Ngưỡng tin cậy
+    const IOU_THRESHOLD = 0.8;                  // Ngưỡng IOU cho NMS
+
+    let session = null;
+    let isModelReady = false;
+    let isProcessing = false;
+    let detectionInterval = null;
+
+    // ---------- Hàm log (hiển thị cả console và giao diện) ----------
+    function log(message, isError = false) {
+        const prefix = isError ? "❌ " : "✅ ";
+        const formatted = prefix + message;
+        console.log(formatted);
+        resultDiv.innerText = message;
+        if (logBox) {
+            logBox.innerText += formatted + "\n";
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+    }
+
+    // ---------- Cấu hình ONNX Runtime (quan trọng: đường dẫn WASM) ----------
+    if (typeof ort === "undefined") {
+        log("ONNX Runtime chưa được tải. Kiểm tra thẻ script CDN.", true);
+        return;
+    }
+    // Chỉ định thư mục chứa file .wasm (dùng CDN chính thức của ONNX)
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/";
+    ort.env.wasm.simd = true;
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.proxy = false;
+
+    // ==================== CAMERA ====================
+    async function startCamera() {
+        try {
+            log("📷 Yêu cầu camera sau...");
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: "environment" },
+                audio: false
+            });
+            video.srcObject = stream;
+            video.setAttribute("playsinline", "");
+            video.muted = true;
+            await video.play();
+            log("Camera sau hoạt động");
+            return true;
+        } catch (err) {
+            log("Lỗi camera sau, thử camera trước", true);
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                video.srcObject = stream;
+                await video.play();
+                log("Camera trước OK");
+                return true;
+            } catch (e2) {
+                log("Không thể mở camera: " + e2.message, true);
+                return false;
+            }
+        }
+    }
+
+    // ==================== LOAD MODEL ====================
+    async function loadModel() {
+        log("📦 Đang tải model...");
+        const response = await fetch(MODEL_PATH);
+        if (!response.ok) throw new Error(`HTTP ${response.status} - ${response.statusText}`);
+        const buffer = await response.arrayBuffer();
+        log(`Model size: ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
+
+        // Tạo session với backend wasm (mặc định)
+        const sess = await ort.InferenceSession.create(buffer, {
+            executionProviders: ["wasm"]
+        });
+        log("Model loaded thành công!");
+        return sess;
+    }
+
+    // ==================== TIỀN XỬ LÝ VIDEO ====================
+    // Resize video về INPUT_SIZE x INPUT_SIZE, giữ tỷ lệ, padding đen
+    function preprocessVideo() {
+        const w = video.videoWidth;
+        const h = video.videoHeight;
+        if (w === 0 || h === 0) throw new Error("Video chưa có kích thước");
+
+        const tempCanvas = document.createElement("canvas");
+        tempCanvas.width = INPUT_SIZE;
+        tempCanvas.height = INPUT_SIZE;
+        const tCtx = tempCanvas.getContext("2d");
+
+        const ratio = Math.min(INPUT_SIZE / w, INPUT_SIZE / h);
+        const newW = w * ratio;
+        const newH = h * ratio;
+        const dx = (INPUT_SIZE - newW) / 2;
+        const dy = (INPUT_SIZE - newH) / 2;
+
+        tCtx.fillStyle = "black";
+        tCtx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+        tCtx.drawImage(video, dx, dy, newW, newH);
+
+        const imgData = tCtx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+        const input = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
+        for (let i = 0; i < INPUT_SIZE * INPUT_SIZE; i++) {
+            input[i] = imgData[i * 4] / 255.0;
+            input[i + INPUT_SIZE * INPUT_SIZE] = imgData[i * 4 + 1] / 255.0;
+            input[i + 2 * INPUT_SIZE * INPUT_SIZE] = imgData[i * 4 + 2] / 255.0;
+        }
+        return new ort.Tensor("float32", input, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+    }
+
+    // ==================== PARSE YOLOv8 OUTPUT ====================
+    // Hỗ trợ cả hai layout phổ biến: [1,84,8400] hoặc [1,8400,84]
+    function parseYoloOutput(outputData, dims, imgW, imgH) {
+        let numBoxes, numAttrs, transposed = false;
+
+        if (dims.length !== 3) {
+            console.warn("Dims không phải 3 chiều:", dims);
+            return [];
+        }
+
+        if (dims[1] === 84 && dims[2] > 1000) {
+            numBoxes = dims[2];
+            numAttrs = dims[1];
+            transposed = false;
+        } else if (dims[2] === 84 && dims[1] > 1000) {
+            numBoxes = dims[1];
+            numAttrs = dims[2];
+            transposed = true;
+        } else {
+            // Fallback: đoán
+            const total = outputData.length;
+            numAttrs = 84;
+            numBoxes = total / numAttrs;
+            transposed = false;
+            console.log("DIMS không chuẩn, ước lượng boxes =", numBoxes);
+        }
+
+        const scaleX = imgW / INPUT_SIZE;
+        const scaleY = imgH / INPUT_SIZE;
+        const boxes = [];
+
+        for (let i = 0; i < numBoxes; i++) {
+            let cx, cy, w, h;
+            if (!transposed) {
+                const offset = i * numAttrs;
+                cx = outputData[offset];
+                cy = outputData[offset + 1];
+                w = outputData[offset + 2];
+                h = outputData[offset + 3];
+            } else {
+                cx = outputData[i];
+                cy = outputData[i + numBoxes];
+                w = outputData[i + 2 * numBoxes];
+                h = outputData[i + 3 * numBoxes];
+            }
+
+            // Tìm max confidence (giả sử các class từ index 4 đến hết)
+            let maxConf = 0;
+            for (let j = 4; j < numAttrs; j++) {
+                let score;
+                if (!transposed) score = outputData[i * numAttrs + j];
+                else score = outputData[i + j * numBoxes];
+                if (score > maxConf) maxConf = score;
+            }
+
+            if (maxConf < CONF_THRESHOLD) continue;
+
+            const x1 = (cx - w / 2) * scaleX;
+            const y1 = (cy - h / 2) * scaleY;
+            const x2 = (cx + w / 2) * scaleX;
+            const y2 = (cy + h / 2) * scaleY;
+
+            boxes.push({
+                x1: Math.max(0, x1),
+                y1: Math.max(0, y1),
+                x2: Math.min(imgW, x2),
+                y2: Math.min(imgH, y2),
+                score: maxConf
+            });
+        }
+        return boxes;
+    }
+
+    // ==================== NMS (Non-Maximum Suppression) ====================
+    function iou(boxA, boxB) {
+        const x1 = Math.max(boxA.x1, boxB.x1);
+        const y1 = Math.max(boxA.y1, boxB.y1);
+        const x2 = Math.min(boxA.x2, boxB.x2);
+        const y2 = Math.min(boxA.y2, boxB.y2);
+        const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+        const areaA = (boxA.x2 - boxA.x1) * (boxA.y2 - boxA.y1);
+        const areaB = (boxB.x2 - boxB.x1) * (boxB.y2 - boxB.y1);
+        const union = areaA + areaB - inter;
+        return inter / (union + 1e-6);
+    }
+
+    function nonMaxSuppression(boxes, iouThreshold = IOU_THRESHOLD) {
+        if (boxes.length === 0) return [];
+        boxes.sort((a, b) => b.score - a.score);
+        const result = [];
+        while (boxes.length) {
+            const best = boxes.shift();
+            result.push(best);
+            boxes = boxes.filter(b => iou(best, b) < iouThreshold);
+        }
+        return result;
+    }
+
+    // ==================== VẼ BOUNDING BOX ====================
+    function drawBoxes(boxes) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = "#00ff9c";
+        ctx.lineWidth = 3;
+        for (const box of boxes) {
+            const width = box.x2 - box.x1;
+            const height = box.y2 - box.y1;
+            ctx.strokeRect(box.x1, box.y1, width, height);
+            ctx.fillStyle = "#00ff9c";
+            ctx.font = "bold 14px system-ui";
+            ctx.shadowColor = "black";
+            ctx.fillText(`${Math.round(box.score * 100)}%`, box.x1 + 4, box.y1 - 4);
+        }
+    }
+
+    // ==================== VÒNG LẶP NHẬN DIỆN ====================
+    async function detect() {
+        if (!isModelReady || isProcessing) return;
+        if (!video.videoWidth || video.videoWidth === 0) return;
+
+        isProcessing = true;
+        try {
+            const tensor = preprocessVideo();
+            const results = await session.run({ [session.inputNames[0]]: tensor });
+            const output = results[session.outputNames[0]];
+            let boxes = parseYoloOutput(output.data, output.dims, video.videoWidth, video.videoHeight);
+            boxes = nonMaxSuppression(boxes);
+            drawBoxes(boxes);
+
+            if (boxes.length === 0) {
+                resultDiv.innerText = "🚫 Không thấy biển số";
+            } else {
+                const best = boxes[0];
+                resultDiv.innerText = `🔍 Phát hiện biển (${Math.round(best.score * 100)}%)`;
+                // Có thể cắt crop và gửi sang model OCR ở đây
+            }
+        } catch (err) {
+            console.error("Detect error:", err);
+            resultDiv.innerText = "⚠️ Lỗi nhận diện";
+            log("Lỗi detect: " + err.message, true);
+        } finally {
+            isProcessing = false;
+        }
+    }
+
+    function startDetectionLoop() {
+        if (detectionInterval) clearInterval(detectionInterval);
+        detectionInterval = setInterval(detect, 400);
+        log("🔄 Vòng quét đã chạy (mỗi 400ms)");
+    }
+
+    // ==================== SỰ KIỆN NÚT START ====================
+    startBtn.addEventListener("click", async () => {
+        if (startBtn.disabled) return;
+        startBtn.disabled = true;
+        startBtn.innerText = "⏳ ĐANG KHỞI TẠO...";
+        resultDiv.innerText = "📷 Khởi động...";
+
+        try {
+            log("🚀 Bắt đầu quá trình");
+            const cameraOK = await startCamera();
+            if (!cameraOK) throw new Error("Camera không khả dụng");
+
+            session = await loadModel();
+            isModelReady = true;
+
+            // Chờ video có kích thước thật
+            let attempts = 0;
+            const waitForVideo = setInterval(() => {
+                if (video.videoWidth > 0 && video.videoHeight > 0) {
+                    clearInterval(waitForVideo);
+                    log(`Video ready: ${video.videoWidth}x${video.videoHeight}`);
+                    startDetectionLoop();
+                    startBtn.innerText = "🔄 ĐANG QUÉT";
+                    resultDiv.innerText = "🔍 Đang quan sát...";
+                } else {
+                    attempts++;
+                    if (attempts > 50) { // timeout 10 giây
+                        clearInterval(waitForVideo);
+                        log("Video không có kích thước sau 10 giây", true);
+                        startBtn.disabled = false;
+                        startBtn.innerText = "▶ BẮT ĐẦU QUÉT";
+                    } else {
+                        log(`⏳ Đợi video... (${attempts}/50)`);
+                    }
+                }
+            }, 200);
+        } catch (err) {
+            log("Lỗi khởi tạo: " + err.message, true);
+            startBtn.disabled = false;
+            startBtn.innerText = "▶ BẮT ĐẦU QUÉT";
+            resultDiv.innerText = "⚠️ Lỗi, thử lại";
+        }
+    });
+});
