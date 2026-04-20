@@ -29,10 +29,10 @@ const FPS_LIMIT = 2;
 
 // Danh sách class ký tự
 const CHAR_CLASSES = [
-  '0','1','2','3','4','5','6','7','8','9',
-  'A','B','C','D','E','F','G','H','I','J',
-  'K','L','M','N','O','P','Q','R','S','T',
-  'U','V','W','X','Y','Z'
+  '-', '0','1','2','3','4','5','6','7','8','9',
+  'A','B','C','D','E','F','G','H','J','K','L','M',
+  'N','P','Q','R','S','T','V','W','X','Y',
+  'back_car','plate','u'
 ];
 
 // ==================== Biến toàn cục ====================
@@ -490,7 +490,8 @@ async function detectCharactersOnCrop(plateCanvas) {
         const h = output.data[i + 3 * numBoxesTotal];
         let bestClass = -1;
         let bestScore = 0;
-        for (let c = 0; c < 31; c++) {
+        const numClasses = CHAR_CLASSES.length;
+        for (let c = 0; c < numClasses; c++) {
             const score = output.data[i + (4 + c) * numBoxesTotal];
             if (score > bestScore) {
                 bestScore = score;
