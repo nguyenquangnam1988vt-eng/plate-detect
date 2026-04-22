@@ -1,5 +1,13 @@
 {
   "routes": [
     { "src": "/", "dest": "/index.html" }
+  ],
+  "headers": [
+    {
+      "source": "/model/(.*)",
+      "headers": [
+        { "key": "Content-Type", "value": "application/octet-stream" }
+      ]
+    }
   ]
 }
