@@ -9,35 +9,31 @@ const ctx = canvas.getContext("2d");
 
 // ==================== CẤU HÌNH ====================
 const PLATE_MODEL_PATH = "/model/bienso1.onnx";
-const CHAR_MODEL_PATH = "/model/character.onnx";
+const RECOGNIZER_PATH = "/model/english_g2_jpqd.onnx";
 const INPUT_SIZE = 640;
 
-// Ngưỡng cho biển số
+// Ngưỡng cho biển số (giữ nguyên)
 const CONF_THRESHOLD_PLATE = 0.5;
 const IOU_THRESHOLD_PLATE = 0.45;
 const MIN_BOX_SIZE_PLATE = 30;
 const MIN_ASPECT_RATIO = 1.5;
 const MAX_ASPECT_RATIO = 5.0;
 
-// Ngưỡng cho ký tự
-const CONF_THRESHOLD_CHAR = 0.65;
-const IOU_THRESHOLD_CHAR = 0.4;
+// Ngưỡng cho nhận diện ký tự (dùng CRNN)
+const CONF_THRESHOLD_CHAR = 0.5;   // không dùng trực tiếp, vì CRNN output là sequence
 const CHAR_PADDING_RATIO = 0.2;
 
-// FPS giới hạn (2 khung/giây)
+// FPS giới hạn
 const FPS_LIMIT = 2;
 
-// Danh sách class ký tự
-const CHAR_CLASSES = {
-    0: '0', 1: '1', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9',
-    10: 'A', 11: 'B', 12: 'C', 13: 'D', 14: 'E', 15: 'F', 16: 'G',
-    17: 'H', 18: 'K', 19: 'L', 20: 'M', 21: 'N', 22: 'P', 23: 'R',
-    24: 'S', 25: 'T', 26: 'U', 27: 'V', 28: 'X', 29: 'Y', 30: 'Z'
-};
+// Bảng ký tự của model english_g2_jpqd (95 classes)
+// Thứ tự theo tài liệu EasyOCR ONNX: index 0 là blank, 1-95 là ký tự
+const CHARSET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+const BLANK_INDEX = 0;
 
 // ==================== Biến toàn cục ====================
 let sessionPlate = null;
-let sessionChar = null;
+let sessionRecognizer = null;
 let isModelReady = false;
 let isProcessing = false;
 let tempCanvas = null;
@@ -63,13 +59,13 @@ function log(message, isError = false) {
     }
 }
 
-// ==================== OpenCV ready callback ====================
+// ==================== OpenCV ready callback (vẫn giữ nếu cần xử lý ảnh) ====================
 window._cvReadyCallback = function() {
     cvReady = true;
     log("OpenCV.js đã sẵn sàng");
 };
 
-// ==================== CAMERA VỚI PTZ (ZOOM THẬT) ====================
+// ==================== CAMERA VỚI ZOOM THẬT ====================
 async function startCamera() {
     try {
         log("📷 Mở camera sau (yêu cầu zoom)...");
@@ -90,19 +86,18 @@ async function startCamera() {
             zoomInfo.innerText = `🔍 Hỗ trợ zoom (chạm hai ngón) - Hiện tại: ${currentZoom.toFixed(2)}x`;
             initPinchToZoom();
         } else {
-            log("⚠️ Camera không hỗ trợ zoom thật, chỉ có thể zoom ảo (giao diện)", true);
+            log("⚠️ Camera không hỗ trợ zoom thật", true);
             zoomInfo.innerText = "📱 Camera không hỗ trợ zoom thật";
         }
-        log("Camera sau OK");
         return true;
     } catch (err) {
-        log("Lỗi camera sau (không có PTZ), thử camera trước", true);
+        log("Lỗi camera sau, thử camera trước: " + err.message, true);
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ video: true });
             video.srcObject = stream;
             await video.play();
             videoTrack = stream.getVideoTracks()[0];
-            log("Camera trước OK (không có zoom thật)");
+            log("Camera trước OK (không zoom thật)");
             zoomInfo.innerText = "📱 Camera không hỗ trợ zoom thật";
             return true;
         } catch (e2) {
@@ -112,28 +107,24 @@ async function startCamera() {
     }
 }
 
-// Hàm áp dụng zoom thật
 async function applyZoom(zoomValue) {
     if (!videoTrack) return;
-    const capabilities = videoTrack.getCapabilities();
-    if (!capabilities.zoom) return;
-    const minZ = capabilities.zoom.min;
-    const maxZ = capabilities.zoom.max;
+    const caps = videoTrack.getCapabilities();
+    if (!caps.zoom) return;
+    const minZ = caps.zoom.min;
+    const maxZ = caps.zoom.max;
     let clamped = Math.min(Math.max(zoomValue, minZ), maxZ);
     if (Math.abs(clamped - currentZoom) < 0.01) return;
     try {
-        await videoTrack.applyConstraints({
-            advanced: [{ zoom: clamped }]
-        });
+        await videoTrack.applyConstraints({ advanced: [{ zoom: clamped }] });
         currentZoom = clamped;
         zoomInfo.innerText = `🔍 Zoom: ${currentZoom.toFixed(2)}x (chạm hai ngón)`;
         log(`Zoom thật: ${currentZoom.toFixed(2)}`);
     } catch (err) {
-        log("Lỗi áp dụng zoom: " + err.message, true);
+        log("Lỗi zoom: " + err.message, true);
     }
 }
 
-// Khởi tạo pinch-to-zoom trên video
 function initPinchToZoom() {
     if (!video) return;
     if (hammerManager) hammerManager.destroy();
@@ -141,7 +132,6 @@ function initPinchToZoom() {
     const pinch = new Hammer.Pinch();
     hammerManager.add(pinch);
     pinch.set({ enable: true });
-    
     let initialZoom = 1;
     hammerManager.on('pinchstart', (e) => {
         e.preventDefault();
@@ -149,14 +139,9 @@ function initPinchToZoom() {
     });
     hammerManager.on('pinchmove', (e) => {
         e.preventDefault();
-        let newZoom = initialZoom * e.scale;
-        applyZoom(newZoom);
+        applyZoom(initialZoom * e.scale);
     });
-    hammerManager.on('pinchend', (e) => {
-        e.preventDefault();
-        // không cần thêm hành động
-    });
-    log("✅ Đã kích hoạt pinch-to-zoom trên video");
+    log("✅ Pinch-to-zoom sẵn sàng");
 }
 
 // ==================== Load models ====================
@@ -164,13 +149,11 @@ async function loadModel(path) {
     const response = await fetch(path);
     if (!response.ok) throw new Error(`HTTP ${response.status} for ${path}`);
     const buffer = await response.arrayBuffer();
-    const sess = await ort.InferenceSession.create(buffer, {
-        executionProviders: ["wasm"]
-    });
+    const sess = await ort.InferenceSession.create(buffer, { executionProviders: ["wasm"] });
     return sess;
 }
 
-// ==================== Tiền xử lý ảnh (letterbox) ====================
+// ==================== Tiền xử lý ảnh cho YOLO (biển số) ====================
 function initPreprocess() {
     if (!tempCanvas) {
         tempCanvas = document.createElement("canvas");
@@ -201,7 +184,7 @@ function preprocessImage(source, srcWidth, srcHeight, outWidth, outHeight) {
     return { tensor: new ort.Tensor("float32", input, [1, 3, outWidth, outHeight]), dx, dy, scale };
 }
 
-// ==================== Parse YOLO output ====================
+// ==================== Parse YOLO output (giữ nguyên) ====================
 function parseYoloOutput(outputData, dims, imgW, imgH, numAttrsExpected, letterboxInfo, confThresh, minBoxSize, minAspect, maxAspect) {
     let numBoxes, numAttrs;
     if (dims.length === 3) {
@@ -310,223 +293,120 @@ function cropImageFromVideo(box, paddingRatio) {
     return cropCanvas;
 }
 
-// ==================== XỬ LÝ ẢNH BIỂN SỐ NÂNG CAO (OpenCV) ====================
-async function enhancePlateImage(plateCanvas) {
-    return new Promise((resolve, reject) => {
-        if (!cvReady) {
-            reject("OpenCV chưa sẵn sàng");
-            return;
-        }
-        try {
-            let src = cv.imread(plateCanvas);
-            let gray = new cv.Mat();
-            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-            
-            let bilateral = new cv.Mat();
-            cv.bilateralFilter(gray, bilateral, 9, 75, 75);
-            
-            let equalized = new cv.Mat();
-            cv.equalizeHist(bilateral, equalized);
-            
-            let kernel = cv.matFromArray(3, 3, cv.CV_32F, [
-                0, -1, 0,
-                -1, 5, -1,
-                0, -1, 0
-            ]);
-            let sharpened = new cv.Mat();
-            cv.filter2D(equalized, sharpened, cv.CV_8U, kernel);
-            
-            let thresh = new cv.Mat();
-            cv.adaptiveThreshold(sharpened, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
-            
-            let contours = new cv.MatVector();
-            let hierarchy = new cv.Mat();
-            cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-            
-            let maxArea = 0;
-            let bestContour = null;
-            for (let i = 0; i < contours.size(); i++) {
-                let contour = contours.get(i);
-                let area = cv.contourArea(contour);
-                if (area > maxArea) {
-                    let peri = cv.arcLength(contour, true);
-                    let approx = new cv.Mat();
-                    cv.approxPolyDP(contour, approx, 0.05 * peri, true);
-                    if (approx.rows === 4) {
-                        maxArea = area;
-                        if (bestContour) bestContour.delete();
-                        bestContour = approx.clone();
-                    }
-                    approx.delete();
-                }
-            }
-            
-            let resultMat;
-            if (bestContour) {
-                let pts = [];
-                for (let i = 0; i < 4; i++) {
-                    let x = bestContour.data32S[i*2];
-                    let y = bestContour.data32S[i*2+1];
-                    pts.push({x, y});
-                }
-                pts.sort((a,b) => a.y - b.y);
-                let topPts = pts.slice(0,2).sort((a,b) => a.x - b.x);
-                let bottomPts = pts.slice(2,4).sort((a,b) => a.x - b.x);
-                let srcPoints = [
-                    topPts[0].x, topPts[0].y,
-                    topPts[1].x, topPts[1].y,
-                    bottomPts[1].x, bottomPts[1].y,
-                    bottomPts[0].x, bottomPts[0].y
-                ];
-                let srcMat = cv.matFromArray(4, 1, cv.CV_32FC2, srcPoints);
-                
-                let widthTop = Math.hypot(topPts[1].x - topPts[0].x, topPts[1].y - topPts[0].y);
-                let widthBottom = Math.hypot(bottomPts[1].x - bottomPts[0].x, bottomPts[1].y - bottomPts[0].y);
-                let width = Math.max(widthTop, widthBottom);
-                let heightLeft = Math.hypot(bottomPts[0].x - topPts[0].x, bottomPts[0].y - topPts[0].y);
-                let heightRight = Math.hypot(bottomPts[1].x - topPts[1].x, bottomPts[1].y - topPts[1].y);
-                let height = Math.max(heightLeft, heightRight);
-                
-                let dstPoints = [0, 0, width, 0, width, height, 0, height];
-                let dstMat = cv.matFromArray(4, 1, cv.CV_32FC2, dstPoints);
-                
-                let perspectiveMat = cv.getPerspectiveTransform(srcMat, dstMat);
-                let warped = new cv.Mat();
-                cv.warpPerspective(src, warped, perspectiveMat, new cv.Size(width, height));
-                resultMat = warped;
-                
-                srcMat.delete();
-                dstMat.delete();
-                perspectiveMat.delete();
-                bestContour.delete();
-            } else {
-                resultMat = src.clone();
-            }
-            
-            let outputCanvas = document.createElement("canvas");
-            cv.imshow(outputCanvas, resultMat);
-            
-            src.delete();
-            gray.delete();
-            bilateral.delete();
-            equalized.delete();
-            kernel.delete();
-            sharpened.delete();
-            thresh.delete();
-            contours.delete();
-            hierarchy.delete();
-            if (resultMat) resultMat.delete();
-            
-            resolve(outputCanvas);
-        } catch (err) {
-            reject(err);
-        }
-    });
+// ==================== NHẬN DIỆN KÝ TỰ DÙNG CRNN (EasyOCR) ====================
+// Tiền xử lý cho CRNN: resize về 32x100, grayscale, normalize [0,1]
+function preprocessForCRNN(canvas) {
+    const targetW = 100;
+    const targetH = 32;
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = targetW;
+    tempCanvas.height = targetH;
+    const tempCtx = tempCanvas.getContext("2d");
+    tempCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, targetW, targetH);
+    const imgData = tempCtx.getImageData(0, 0, targetW, targetH).data;
+    // Chuyển sang grayscale và normalize
+    const input = new Float32Array(1 * 1 * targetH * targetW);
+    for (let i = 0; i < targetW * targetH; i++) {
+        const gray = 0.299 * imgData[i*4] + 0.587 * imgData[i*4+1] + 0.114 * imgData[i*4+2];
+        input[i] = gray / 255.0;
+    }
+    // Shape: [1, 1, 32, 100]
+    const tensor = new ort.Tensor("float32", input, [1, 1, targetH, targetW]);
+    return tensor;
 }
 
-// ==================== Tách dòng & hậu xử lý ====================
-function splitLines(boxes) {
-    if (boxes.length === 0) return [[], []];
-    const sorted = [...boxes].sort((a, b) => a.y1 - b.y1);
-    let line1 = [sorted[0]];
-    let line2 = [];
-    for (let i = 1; i < sorted.length; i++) {
-        const prev = line1[line1.length - 1];
-        if (Math.abs(sorted[i].y1 - prev.y1) < 20) {
-            line1.push(sorted[i]);
-        } else {
-            line2.push(sorted[i]);
+// Giải mã CTC: lấy argmax mỗi time step, bỏ blank và các ký tự trùng lặp
+function ctcGreedyDecode(logits, blankIdx) {
+    // logits: mảng 2D [T, num_classes] hoặc 1D [T*num_classes]
+    // Ở đây output từ model thường có shape [1, T, num_classes]
+    // Ta giả sử nhận vào mảng 2D [T, num_classes]
+    if (logits.length === 0) return "";
+    let T = logits.length;
+    let numClasses = logits[0].length;
+    let prevIdx = blankIdx;
+    let result = [];
+    for (let t = 0; t < T; t++) {
+        let maxIdx = 0;
+        let maxVal = logits[t][0];
+        for (let c = 1; c < numClasses; c++) {
+            if (logits[t][c] > maxVal) {
+                maxVal = logits[t][c];
+                maxIdx = c;
+            }
+        }
+        if (maxIdx !== blankIdx && maxIdx !== prevIdx) {
+            result.push(maxIdx);
+        }
+        prevIdx = maxIdx;
+    }
+    // Chuyển index sang ký tự (lưu ý: charset bắt đầu từ index 0 là blank, index 1 là '0',...)
+    // Nhưng CHARSET của ta đã bao gồm blank ở đầu? Thực tế model english_g2 có blank ở index 0,
+    // và các ký tự bắt đầu từ index 1. Ta sẽ mapping: idx-1 vào CHARSET.
+    let text = "";
+    for (let idx of result) {
+        if (idx > 0 && idx-1 < CHARSET.length) {
+            text += CHARSET[idx-1];
         }
     }
-    return [line1, line2];
+    return text;
 }
 
-function fixPlateText(text) {
-    return text
-        .replace(/O/g, '0')
-        .replace(/I/g, '1')
-        .replace(/Z/g, '2')
-        .replace(/S/g, '5')
-        .replace(/B/g, '8');
-}
-
-// ==================== Nhận diện ký tự trên crop ====================
-async function detectCharactersOnCrop(plateCanvas) {
-    let enhancedCanvas;
+// Hàm chính nhận diện ký tự trên crop (thay thế detectCharactersOnCrop cũ)
+async function recognizePlateText(plateCanvas) {
     try {
-        enhancedCanvas = await enhancePlateImage(plateCanvas);
-    } catch (err) {
-        log("OpenCV xử lý lỗi, dùng ảnh gốc: " + err, true);
-        enhancedCanvas = plateCanvas;
-    }
-    
-    if (cvReady) {
-        try {
-            let src = cv.imread(enhancedCanvas);
-            let upscaled = new cv.Mat();
-            cv.resize(src, upscaled, new cv.Size(0, 0), 2.0, 2.0, cv.INTER_CUBIC);
-            let scaledCanvas = document.createElement("canvas");
-            cv.imshow(scaledCanvas, upscaled);
-            src.delete();
-            upscaled.delete();
-            enhancedCanvas = scaledCanvas;
-        } catch (err) {
-            log("Scale up lỗi: " + err, true);
-        }
-    }
-    
-    const { tensor, dx, dy, scale } = preprocessImage(enhancedCanvas, enhancedCanvas.width, enhancedCanvas.height, INPUT_SIZE, INPUT_SIZE);
-    const results = await sessionChar.run({ [sessionChar.inputNames[0]]: tensor });
-    const output = results[sessionChar.outputNames[0]];
-    const letterboxInfo = { dx, dy, scale };
-    const numBoxesTotal = output.data.length / 36;
-    const invScale = 1 / scale;
-    
-    const charBoxes = [];
-    for (let i = 0; i < numBoxesTotal; i++) {
-        const cx = output.data[i];
-        const cy = output.data[i + numBoxesTotal];
-        const w = output.data[i + 2 * numBoxesTotal];
-        const h = output.data[i + 3 * numBoxesTotal];
-        let bestClass = -1;
-        let bestScore = 0;
-        for (let c = 0; c < 31; c++) {
-            const score = output.data[i + (4 + c) * numBoxesTotal];
-            if (score > bestScore) {
-                bestScore = score;
-                bestClass = c;
+        // Preprocess cho CRNN
+        const inputTensor = preprocessForCRNN(plateCanvas);
+        // Chạy inference
+        const results = await sessionRecognizer.run({ [sessionRecognizer.inputNames[0]]: inputTensor });
+        const output = results[sessionRecognizer.outputNames[0]];
+        // output thường có shape [1, T, num_classes] hoặc [1, num_classes, T]
+        let logits2D = null;
+        if (output.dims.length === 3) {
+            const batch = output.dims[0];
+            const dim1 = output.dims[1];
+            const dim2 = output.dims[2];
+            if (dim2 === CHARSET.length + 1) { // [1, T, C]
+                const T = dim1;
+                const C = dim2;
+                logits2D = [];
+                for (let t = 0; t < T; t++) {
+                    let row = [];
+                    for (let c = 0; c < C; c++) {
+                        row.push(output.data[t * C + c]);
+                    }
+                    logits2D.push(row);
+                }
+            } else if (dim1 === CHARSET.length + 1) { // [1, C, T]
+                const T = dim2;
+                const C = dim1;
+                logits2D = [];
+                for (let t = 0; t < T; t++) {
+                    let row = [];
+                    for (let c = 0; c < C; c++) {
+                        row.push(output.data[c * T + t]);
+                    }
+                    logits2D.push(row);
+                }
+            } else {
+                throw new Error("Unexpected output shape");
             }
+        } else {
+            throw new Error("Output is not 3D");
         }
-        if (bestScore < CONF_THRESHOLD_CHAR) continue;
-        const label = CHAR_CLASSES[bestClass];
-        if (!label) continue;
-        
-        let x1 = (cx - dx) * invScale - w * invScale / 2;
-        let y1 = (cy - dy) * invScale - h * invScale / 2;
-        let x2 = (cx - dx) * invScale + w * invScale / 2;
-        let y2 = (cy - dy) * invScale + h * invScale / 2;
-        x1 = Math.max(0, x1);
-        y1 = Math.max(0, y1);
-        x2 = Math.min(enhancedCanvas.width, x2);
-        y2 = Math.min(enhancedCanvas.height, y2);
-        if (x2 - x1 < 5 || y2 - y1 < 5) continue;
-        charBoxes.push({ x1, y1, x2, y2, score: bestScore, label });
+        const rawText = ctcGreedyDecode(logits2D, BLANK_INDEX);
+        // Chuyển sang chữ hoa (biển số thường in hoa)
+        let finalText = rawText.toUpperCase();
+        // Lọc bỏ ký tự không mong muốn (chỉ giữ A-Z, 0-9)
+        finalText = finalText.replace(/[^A-Z0-9]/g, '');
+        return finalText;
+    } catch (err) {
+        log("Lỗi nhận diện ký tự: " + err.message, true);
+        return "";
     }
-    
-    const nmsChar = nonMaxSuppression(charBoxes.map(b => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2, score: b.score, label: b.label })), IOU_THRESHOLD_CHAR);
-    const [lineUp, lineDown] = splitLines(nmsChar);
-    lineUp.sort((a,b) => a.x1 - b.x1);
-    lineDown.sort((a,b) => a.x1 - b.x1);
-    
-    let plateText = lineUp.map(b => b.label).join('');
-    if (lineDown.length > 0) plateText += lineDown.map(b => b.label).join('');
-    plateText = fixPlateText(plateText);
-    
-    return { boxes: nmsChar, text: plateText };
 }
 
 // ==================== Vẽ kết quả ====================
-function drawResults(plateBoxes, charResultsForPlate) {
+function drawResults(plateBoxes, recognizedText) {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -539,14 +419,14 @@ function drawResults(plateBoxes, charResultsForPlate) {
         ctx.font = "bold 14px monospace";
         ctx.fillText(`${Math.round(box.score * 100)}%`, box.x1 + 4, box.y1 - 4);
     }
-    if (charResultsForPlate && charResultsForPlate.boxes) {
+    // Nếu có text thì hiển thị lên canvas
+    if (recognizedText && plateBoxes.length > 0) {
         ctx.fillStyle = "#ffaa44";
-        ctx.font = "bold 12px monospace";
-        for (const ch of charResultsForPlate.boxes) {
-            ctx.strokeStyle = "#ffaa44";
-            ctx.strokeRect(ch.x1, ch.y1, ch.x2 - ch.x1, ch.y2 - ch.y1);
-            ctx.fillText(ch.label, ch.x1 + 2, ch.y1 - 2);
-        }
+        ctx.font = "bold 16px monospace";
+        ctx.shadowColor = "black";
+        ctx.shadowBlur = 2;
+        ctx.fillText(recognizedText, plateBoxes[0].x1, plateBoxes[0].y1 - 10);
+        ctx.shadowColor = "transparent";
     }
 }
 
@@ -556,29 +436,36 @@ async function detect() {
     if (!video.videoWidth || video.videoWidth === 0) return;
     isProcessing = true;
     try {
+        // 1. Phát hiện biển số bằng YOLO
         const { tensor, dx, dy, scale } = preprocessImage(video, video.videoWidth, video.videoHeight, INPUT_SIZE, INPUT_SIZE);
         const resultsPlate = await sessionPlate.run({ [sessionPlate.inputNames[0]]: tensor });
         const outputPlate = resultsPlate[sessionPlate.outputNames[0]];
         let plateBoxes = parseYoloOutput(outputPlate.data, outputPlate.dims, video.videoWidth, video.videoHeight, 5, { dx, dy, scale }, CONF_THRESHOLD_PLATE, MIN_BOX_SIZE_PLATE, MIN_ASPECT_RATIO, MAX_ASPECT_RATIO);
         plateBoxes = nonMaxSuppression(plateBoxes, IOU_THRESHOLD_PLATE);
+        
         let finalText = "🚫 Không thấy biển số";
-        let charData = null;
+        let recognizedText = "";
+        
         if (plateBoxes.length > 0) {
             const bestPlate = plateBoxes[0];
             const cropCanvas = cropImageFromVideo(bestPlate, CHAR_PADDING_RATIO);
             if (cropCanvas) {
-                charData = await detectCharactersOnCrop(cropCanvas);
-                if (charData.text.length > 0) finalText = `🔢 ${charData.text}`;
-                else finalText = `⚠️ Biển số (${Math.round(bestPlate.score*100)}%) nhưng không đọc được ký tự`;
+                recognizedText = await recognizePlateText(cropCanvas);
+                if (recognizedText.length > 0) {
+                    finalText = `🔢 ${recognizedText}`;
+                } else {
+                    finalText = `⚠️ Biển số (${Math.round(bestPlate.score*100)}%) nhưng không đọc được ký tự`;
+                }
             } else {
                 finalText = `⚠️ Lỗi crop biển số`;
             }
         }
         resultTextDiv.innerText = finalText;
-        drawResults(plateBoxes, charData);
+        drawResults(plateBoxes, recognizedText);
     } catch (err) {
         console.error(err);
         resultTextDiv.innerText = "⚠️ Lỗi nhận diện";
+        log("Detect error: " + err.message, true);
     } finally {
         isProcessing = false;
     }
@@ -590,7 +477,7 @@ function detectLoop(now) {
     const delta = now - lastTimestamp;
     if (delta >= 1000 / FPS_LIMIT && !isProcessing) {
         lastTimestamp = now;
-        detect(); // gọi async không await
+        detect(); // async
     }
     animationId = requestAnimationFrame(detectLoop);
 }
@@ -599,7 +486,7 @@ function startDetectionLoop() {
     if (animationId) cancelAnimationFrame(animationId);
     lastTimestamp = 0;
     animationId = requestAnimationFrame(detectLoop);
-    log(`🔄 Vòng quét với FPS_LIMIT = ${FPS_LIMIT} (giảm tải CPU)`);
+    log(`🔄 Vòng quét với FPS_LIMIT = ${FPS_LIMIT}`);
 }
 
 // ==================== KHỞI TẠO ====================
@@ -612,65 +499,35 @@ startBtn.addEventListener("click", async () => {
         log("🚀 Bắt đầu");
         const cameraOK = await startCamera();
         if (!cameraOK) throw new Error("Camera lỗi");
-        log("⏳ Đang tải model biển số...");
+        
+        log("⏳ Đang tải model biển số (bienso1.onnx)...");
         sessionPlate = await loadModel(PLATE_MODEL_PATH);
-        log("⏳ Đang tải model ký tự...");
-        sessionChar = await loadModel(CHAR_MODEL_PATH);
+        log("⏳ Đang tải model nhận dạng ký tự (english_g2_jpqd.onnx)...");
+        sessionRecognizer = await loadModel(RECOGNIZER_PATH);
         isModelReady = true;
         initPreprocess();
         
-        let waitCount = 0;
-        const waitForCV = setInterval(() => {
-            if (cvReady) {
-                clearInterval(waitForCV);
-                log("OpenCV ready, bắt đầu video...");
-                let attempts = 0;
-                const waitForVideo = setInterval(() => {
-                    if (video.videoWidth > 0 && video.videoHeight > 0) {
-                        clearInterval(waitForVideo);
-                        log(`Video ready: ${video.videoWidth}x${video.videoHeight}`);
-                        startDetectionLoop();
-                        startBtn.innerText = "🔄 ĐANG QUÉT";
-                        resultTextDiv.innerText = "🔍 Đang quan sát...";
-                    } else {
-                        attempts++;
-                        if (attempts > 50) {
-                            clearInterval(waitForVideo);
-                            log("Video timeout", true);
-                            startBtn.disabled = false;
-                            startBtn.innerText = "▶ BẮT ĐẦU QUÉT";
-                        } else if (attempts % 10 === 0) {
-                            log(`⏳ Đợi video... (${attempts}/50)`);
-                        }
-                    }
-                }, 200);
+        // Chờ video có kích thước
+        let attempts = 0;
+        const waitForVideo = setInterval(() => {
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+                clearInterval(waitForVideo);
+                log(`Video ready: ${video.videoWidth}x${video.videoHeight}`);
+                startDetectionLoop();
+                startBtn.innerText = "🔄 ĐANG QUÉT";
+                resultTextDiv.innerText = "🔍 Đang quan sát...";
             } else {
-                waitCount++;
-                if (waitCount > 100) {
-                    clearInterval(waitForCV);
-                    log("OpenCV không tải được, chạy fallback", true);
-                    cvReady = false;
-                    let attempts = 0;
-                    const waitForVideo = setInterval(() => {
-                        if (video.videoWidth > 0 && video.videoHeight > 0) {
-                            clearInterval(waitForVideo);
-                            log(`Video ready: ${video.videoWidth}x${video.videoHeight}`);
-                            startDetectionLoop();
-                            startBtn.innerText = "🔄 ĐANG QUÉT";
-                            resultTextDiv.innerText = "🔍 Đang quan sát...";
-                        } else {
-                            attempts++;
-                            if (attempts > 50) {
-                                clearInterval(waitForVideo);
-                                log("Video timeout", true);
-                                startBtn.disabled = false;
-                                startBtn.innerText = "▶ BẮT ĐẦU QUÉT";
-                            }
-                        }
-                    }, 200);
+                attempts++;
+                if (attempts > 50) {
+                    clearInterval(waitForVideo);
+                    log("Video timeout", true);
+                    startBtn.disabled = false;
+                    startBtn.innerText = "▶ BẮT ĐẦU QUÉT";
+                } else if (attempts % 10 === 0) {
+                    log(`⏳ Đợi video... (${attempts}/50)`);
                 }
             }
-        }, 100);
+        }, 200);
     } catch (err) {
         log("Lỗi: " + err.message, true);
         startBtn.disabled = false;
