@@ -12,24 +12,20 @@ const PLATE_MODEL_PATH = "/model/bienso1.onnx";
 const RECOGNIZER_PATH = "/model/english_g2_jpqd.onnx";
 const INPUT_SIZE = 640;
 
-// Ngưỡng cho biển số (giữ nguyên)
+// Ngưỡng cho biển số
 const CONF_THRESHOLD_PLATE = 0.5;
 const IOU_THRESHOLD_PLATE = 0.45;
 const MIN_BOX_SIZE_PLATE = 30;
 const MIN_ASPECT_RATIO = 1.5;
 const MAX_ASPECT_RATIO = 5.0;
-
-// Ngưỡng cho nhận diện ký tự (dùng CRNN)
-const CONF_THRESHOLD_CHAR = 0.5;   // không dùng trực tiếp, vì CRNN output là sequence
 const CHAR_PADDING_RATIO = 0.2;
 
 // FPS giới hạn
-const FPS_LIMIT = 2;
+const FPS_LIMIT = 3; // tăng lên 3 để mượt hơn
 
-// Bảng ký tự của model english_g2_jpqd (95 classes)
-// Thứ tự theo tài liệu EasyOCR ONNX: index 0 là blank, 1-95 là ký tự
-const CHARSET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
-const BLANK_INDEX = 0;
+// Bảng ký tự chuẩn cho biển số (số và chữ in hoa)
+const CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const BLANK_INDEX = 0; // blank là index 0 (theo model)
 
 // ==================== Biến toàn cục ====================
 let sessionPlate = null;
@@ -43,7 +39,6 @@ let cvReady = false;
 let animationId = null;
 let lastTimestamp = 0;
 
-// Biến cho zoom thật
 let videoTrack = null;
 let currentZoom = 1;
 let hammerManager = null;
@@ -59,7 +54,7 @@ function log(message, isError = false) {
     }
 }
 
-// ==================== OpenCV ready callback (vẫn giữ nếu cần xử lý ảnh) ====================
+// ==================== OpenCV ready callback ====================
 window._cvReadyCallback = function() {
     cvReady = true;
     log("OpenCV.js đã sẵn sàng");
@@ -153,7 +148,7 @@ async function loadModel(path) {
     return sess;
 }
 
-// ==================== Tiền xử lý ảnh cho YOLO (biển số) ====================
+// ==================== Tiền xử lý cho YOLO (biển số) ====================
 function initPreprocess() {
     if (!tempCanvas) {
         tempCanvas = document.createElement("canvas");
@@ -184,7 +179,7 @@ function preprocessImage(source, srcWidth, srcHeight, outWidth, outHeight) {
     return { tensor: new ort.Tensor("float32", input, [1, 3, outWidth, outHeight]), dx, dy, scale };
 }
 
-// ==================== Parse YOLO output (giữ nguyên) ====================
+// ==================== Parse YOLO output ====================
 function parseYoloOutput(outputData, dims, imgW, imgH, numAttrsExpected, letterboxInfo, confThresh, minBoxSize, minAspect, maxAspect) {
     let numBoxes, numAttrs;
     if (dims.length === 3) {
@@ -294,56 +289,95 @@ function cropImageFromVideo(box, paddingRatio) {
 }
 
 // ==================== NHẬN DIỆN KÝ TỰ DÙNG CRNN (EasyOCR) ====================
-// Tiền xử lý cho CRNN: resize về 32x100, grayscale, normalize [0,1]
+// Hàm reshape output của model (xử lý [1,T,C] hoặc [1,C,T])
+function reshapeOutput(output) {
+    const dims = output.dims; // [1, T, C] hoặc [1, C, T]
+    const data = output.data;
+    let T, C;
+    let logits = [];
+
+    if (dims[1] > dims[2]) {
+        // dạng [1, C, T]
+        C = dims[1];
+        T = dims[2];
+        for (let t = 0; t < T; t++) {
+            let row = [];
+            for (let c = 0; c < C; c++) {
+                row.push(data[c * T + t]);
+            }
+            logits.push(row);
+        }
+    } else {
+        // dạng [1, T, C]
+        T = dims[1];
+        C = dims[2];
+        for (let t = 0; t < T; t++) {
+            let row = [];
+            for (let c = 0; c < C; c++) {
+                row.push(data[t * C + c]);
+            }
+            logits.push(row);
+        }
+    }
+    return logits;
+}
+
+// Tiền xử lý ảnh cho CRNN: giữ tỷ lệ, padding đen, resize về 32x100
 function preprocessForCRNN(canvas) {
     const targetW = 100;
     const targetH = 32;
+
     const tempCanvas = document.createElement("canvas");
     tempCanvas.width = targetW;
     tempCanvas.height = targetH;
-    const tempCtx = tempCanvas.getContext("2d");
-    tempCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, targetW, targetH);
-    const imgData = tempCtx.getImageData(0, 0, targetW, targetH).data;
-    // Chuyển sang grayscale và normalize
-    const input = new Float32Array(1 * 1 * targetH * targetW);
+    const ctx = tempCanvas.getContext("2d");
+
+    const scale = Math.min(targetW / canvas.width, targetH / canvas.height);
+    const newW = canvas.width * scale;
+    const newH = canvas.height * scale;
+    const dx = (targetW - newW) / 2;
+    const dy = (targetH - newH) / 2;
+
+    ctx.fillStyle = "black";
+    ctx.fillRect(0, 0, targetW, targetH);
+    ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, dx, dy, newW, newH);
+
+    const imgData = ctx.getImageData(0, 0, targetW, targetH).data;
+
+    const input = new Float32Array(targetW * targetH);
     for (let i = 0; i < targetW * targetH; i++) {
         const gray = 0.299 * imgData[i*4] + 0.587 * imgData[i*4+1] + 0.114 * imgData[i*4+2];
         input[i] = gray / 255.0;
     }
-    // Shape: [1, 1, 32, 100]
-    const tensor = new ort.Tensor("float32", input, [1, 1, targetH, targetW]);
-    return tensor;
+
+    return new ort.Tensor("float32", input, [1, 1, targetH, targetW]);
 }
 
-// Giải mã CTC: lấy argmax mỗi time step, bỏ blank và các ký tự trùng lặp
-function ctcGreedyDecode(logits, blankIdx) {
-    // logits: mảng 2D [T, num_classes] hoặc 1D [T*num_classes]
-    // Ở đây output từ model thường có shape [1, T, num_classes]
-    // Ta giả sử nhận vào mảng 2D [T, num_classes]
-    if (logits.length === 0) return "";
-    let T = logits.length;
-    let numClasses = logits[0].length;
+// Giải mã CTC (greedy)
+function ctcGreedyDecode(logits2D, blankIdx) {
+    if (!logits2D.length) return "";
+    const T = logits2D.length;
     let prevIdx = blankIdx;
-    let result = [];
+    let resultIndices = [];
     for (let t = 0; t < T; t++) {
         let maxIdx = 0;
-        let maxVal = logits[t][0];
-        for (let c = 1; c < numClasses; c++) {
-            if (logits[t][c] > maxVal) {
-                maxVal = logits[t][c];
+        let maxVal = logits2D[t][0];
+        for (let c = 1; c < logits2D[t].length; c++) {
+            if (logits2D[t][c] > maxVal) {
+                maxVal = logits2D[t][c];
                 maxIdx = c;
             }
         }
         if (maxIdx !== blankIdx && maxIdx !== prevIdx) {
-            result.push(maxIdx);
+            resultIndices.push(maxIdx);
         }
         prevIdx = maxIdx;
     }
-    // Chuyển index sang ký tự (lưu ý: charset bắt đầu từ index 0 là blank, index 1 là '0',...)
-    // Nhưng CHARSET của ta đã bao gồm blank ở đầu? Thực tế model english_g2 có blank ở index 0,
-    // và các ký tự bắt đầu từ index 1. Ta sẽ mapping: idx-1 vào CHARSET.
+    // Chuyển index sang ký tự (lưu ý: CHARSET bắt đầu từ index 0, blank ở index 0)
+    // Nếu model có blank ở index 0 thì các ký tự thật bắt đầu từ index 1.
+    // Ta map: index-1 vào CHARSET, nếu index=0 thì bỏ qua.
     let text = "";
-    for (let idx of result) {
+    for (let idx of resultIndices) {
         if (idx > 0 && idx-1 < CHARSET.length) {
             text += CHARSET[idx-1];
         }
@@ -351,53 +385,28 @@ function ctcGreedyDecode(logits, blankIdx) {
     return text;
 }
 
-// Hàm chính nhận diện ký tự trên crop (thay thế detectCharactersOnCrop cũ)
+// Lọc và format biển số
+function cleanPlate(text) {
+    // Chỉ giữ chữ in hoa và số
+    let cleaned = text.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    // Thêm dấu gạch ngang đơn giản (3 số đầu, dấu gạch, các số còn lại)
+    // Nếu độ dài >= 3: ví dụ "51A12345" -> "51A-12345"
+    if (cleaned.length >= 3) {
+        // Tìm vị trí cắt: có thể cắt sau 3 ký tự hoặc sau chữ cái cuối cùng của phần đầu
+        // Ở đây cắt sau 3 ký tự đầu tiên
+        cleaned = cleaned.slice(0,3) + "-" + cleaned.slice(3);
+    }
+    return cleaned;
+}
+
 async function recognizePlateText(plateCanvas) {
     try {
-        // Preprocess cho CRNN
         const inputTensor = preprocessForCRNN(plateCanvas);
-        // Chạy inference
         const results = await sessionRecognizer.run({ [sessionRecognizer.inputNames[0]]: inputTensor });
         const output = results[sessionRecognizer.outputNames[0]];
-        // output thường có shape [1, T, num_classes] hoặc [1, num_classes, T]
-        let logits2D = null;
-        if (output.dims.length === 3) {
-            const batch = output.dims[0];
-            const dim1 = output.dims[1];
-            const dim2 = output.dims[2];
-            if (dim2 === CHARSET.length + 1) { // [1, T, C]
-                const T = dim1;
-                const C = dim2;
-                logits2D = [];
-                for (let t = 0; t < T; t++) {
-                    let row = [];
-                    for (let c = 0; c < C; c++) {
-                        row.push(output.data[t * C + c]);
-                    }
-                    logits2D.push(row);
-                }
-            } else if (dim1 === CHARSET.length + 1) { // [1, C, T]
-                const T = dim2;
-                const C = dim1;
-                logits2D = [];
-                for (let t = 0; t < T; t++) {
-                    let row = [];
-                    for (let c = 0; c < C; c++) {
-                        row.push(output.data[c * T + t]);
-                    }
-                    logits2D.push(row);
-                }
-            } else {
-                throw new Error("Unexpected output shape");
-            }
-        } else {
-            throw new Error("Output is not 3D");
-        }
+        const logits2D = reshapeOutput(output);
         const rawText = ctcGreedyDecode(logits2D, BLANK_INDEX);
-        // Chuyển sang chữ hoa (biển số thường in hoa)
-        let finalText = rawText.toUpperCase();
-        // Lọc bỏ ký tự không mong muốn (chỉ giữ A-Z, 0-9)
-        finalText = finalText.replace(/[^A-Z0-9]/g, '');
+        let finalText = cleanPlate(rawText);
         return finalText;
     } catch (err) {
         log("Lỗi nhận diện ký tự: " + err.message, true);
@@ -419,10 +428,9 @@ function drawResults(plateBoxes, recognizedText) {
         ctx.font = "bold 14px monospace";
         ctx.fillText(`${Math.round(box.score * 100)}%`, box.x1 + 4, box.y1 - 4);
     }
-    // Nếu có text thì hiển thị lên canvas
     if (recognizedText && plateBoxes.length > 0) {
         ctx.fillStyle = "#ffaa44";
-        ctx.font = "bold 16px monospace";
+        ctx.font = "bold 18px monospace";
         ctx.shadowColor = "black";
         ctx.shadowBlur = 2;
         ctx.fillText(recognizedText, plateBoxes[0].x1, plateBoxes[0].y1 - 10);
@@ -436,7 +444,6 @@ async function detect() {
     if (!video.videoWidth || video.videoWidth === 0) return;
     isProcessing = true;
     try {
-        // 1. Phát hiện biển số bằng YOLO
         const { tensor, dx, dy, scale } = preprocessImage(video, video.videoWidth, video.videoHeight, INPUT_SIZE, INPUT_SIZE);
         const resultsPlate = await sessionPlate.run({ [sessionPlate.inputNames[0]]: tensor });
         const outputPlate = resultsPlate[sessionPlate.outputNames[0]];
@@ -447,7 +454,8 @@ async function detect() {
         let recognizedText = "";
         
         if (plateBoxes.length > 0) {
-            const bestPlate = plateBoxes[0];
+            // Chọn box có score cao nhất
+            const bestPlate = plateBoxes.reduce((a, b) => a.score > b.score ? a : b);
             const cropCanvas = cropImageFromVideo(bestPlate, CHAR_PADDING_RATIO);
             if (cropCanvas) {
                 recognizedText = await recognizePlateText(cropCanvas);
@@ -477,7 +485,7 @@ function detectLoop(now) {
     const delta = now - lastTimestamp;
     if (delta >= 1000 / FPS_LIMIT && !isProcessing) {
         lastTimestamp = now;
-        detect(); // async
+        detect();
     }
     animationId = requestAnimationFrame(detectLoop);
 }
@@ -486,7 +494,7 @@ function startDetectionLoop() {
     if (animationId) cancelAnimationFrame(animationId);
     lastTimestamp = 0;
     animationId = requestAnimationFrame(detectLoop);
-    log(`🔄 Vòng quét với FPS_LIMIT = ${FPS_LIMIT}`);
+    log(`🔄 Vòng quét với FPS_LIMIT = ${FPS_LIMIT} (giảm tải CPU)`);
 }
 
 // ==================== KHỞI TẠO ====================
@@ -507,7 +515,6 @@ startBtn.addEventListener("click", async () => {
         isModelReady = true;
         initPreprocess();
         
-        // Chờ video có kích thước
         let attempts = 0;
         const waitForVideo = setInterval(() => {
             if (video.videoWidth > 0 && video.videoHeight > 0) {
