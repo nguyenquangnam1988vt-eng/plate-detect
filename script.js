@@ -1,3 +1,131 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Nhận diện biển số xe Việt Nam - OCR Full</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #0a0f1e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 16px;
+            color: white;
+        }
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+        }
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            background: #000;
+            border-radius: 20px;
+            overflow: hidden;
+            margin-bottom: 16px;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: auto;
+            border-radius: 20px;
+        }
+        video {
+            position: relative;
+            z-index: 1;
+        }
+        canvas {
+            z-index: 2;
+        }
+        .result-panel {
+            background: #1e2a3a;
+            border-radius: 20px;
+            padding: 16px;
+            margin-top: 20px;
+            text-align: center;
+        }
+        #resultText {
+            font-size: 28px;
+            font-weight: bold;
+            background: #000000aa;
+            padding: 12px;
+            border-radius: 50px;
+            letter-spacing: 2px;
+            font-family: monospace;
+        }
+        button {
+            background: #00b4d8;
+            border: none;
+            padding: 14px 28px;
+            font-size: 18px;
+            font-weight: bold;
+            border-radius: 50px;
+            color: white;
+            margin: 10px 0;
+            width: 100%;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        #zoomInfo {
+            font-size: 14px;
+            background: #00000099;
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            margin-top: 8px;
+        }
+        #logBox {
+            background: #000000cc;
+            font-size: 11px;
+            height: 120px;
+            overflow-y: auto;
+            padding: 8px;
+            border-radius: 12px;
+            margin-top: 12px;
+            font-family: monospace;
+        }
+        .status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 8px;
+        }
+    </style>
+    <!-- ONNX Runtime Web -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.min.js"></script>
+    <!-- Hammer.js cho pinch zoom -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+    <!-- OpenCV.js -->
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="window._cvReadyCallback()"></script>
+</head>
+<body>
+<div class="container">
+    <div class="video-wrapper" style="position: relative; padding-bottom: 75%;">
+        <video id="video" autoplay playsinline muted style="position: absolute; width:100%; height:100%; object-fit: cover;"></video>
+        <canvas id="canvas" style="position: absolute; width:100%; height:100%;"></canvas>
+    </div>
+    <div class="status">
+        <span id="zoomInfo">🔍 Zoom: --</span>
+        <button id="startBtn">▶ BẮT ĐẦU QUÉT</button>
+    </div>
+    <div class="result-panel">
+        <div id="resultText">🚫 Chưa nhận diện</div>
+    </div>
+    <div id="logBox"></div>
+</div>
+
+<script>
 // ==================== DOM elements ====================
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
@@ -26,7 +154,7 @@ const FPS_LIMIT = 5;
 // ==================== Biến toàn cục ====================
 let sessionPlate = null;
 let sessionOCR = null;
-let sessionCLS = null; // có thể dùng để chỉnh hướng ảnh sau
+let sessionCLS = null;
 let isModelReady = false;
 let isProcessing = false;
 let cvReady = false;
@@ -135,7 +263,7 @@ async function loadModel(path) {
     return await ort.InferenceSession.create(buffer, { executionProviders: ["wasm"] });
 }
 
-// ==================== Preprocess cho YOLO (giữ nguyên) ====================
+// ==================== Preprocess cho YOLO ====================
 function initPreprocess() {
     if (!tempCanvas) {
         tempCanvas = document.createElement("canvas");
@@ -164,7 +292,7 @@ function preprocessImage(source, srcWidth, srcHeight, outWidth, outHeight) {
     return { tensor: new ort.Tensor("float32", input, [1, 3, outWidth, outHeight]), dx, dy, scale };
 }
 
-// ==================== Parse YOLO output (plate detection) ====================
+// ==================== Parse YOLO output ====================
 function parseYoloOutput(outputData, dims, imgW, imgH, numAttrsExpected, letterboxInfo, confThresh, minBoxSize, minAspect, maxAspect) {
     let numBoxes, numAttrs;
     if (dims.length === 3) {
@@ -225,56 +353,95 @@ function nonMaxSuppression(boxes, iouThresh) {
     return result;
 }
 
-// ==================== PPOCR RECOGNITION (thay thế hoàn toàn CRAFT + CRNN cũ) ====================
+// ==================== TĂNG CƯỜNG ĐỘ TƯƠNG PHẢN (CLAHE + Sharpening) ====================
+function enhancePlateContrast(plateCanvas) {
+    return new Promise((resolve) => {
+        if (!cvReady) {
+            log("OpenCV chưa ready, bỏ qua tăng cường", true);
+            resolve(plateCanvas);
+            return;
+        }
+        try {
+            let src = cv.imread(plateCanvas);
+            let gray = new cv.Mat();
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+            // CLAHE
+            let clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+            let equalized = new cv.Mat();
+            clahe.apply(gray, equalized);
+
+            // Gaussian blur nhẹ
+            let blurred = new cv.Mat();
+            cv.GaussianBlur(equalized, blurred, new cv.Size(3, 3), 0);
+
+            // Sharpening kernel
+            let kernel = cv.matFromArray(3, 3, cv.CV_32F, [0, -1, 0, -1, 5, -1, 0, -1, 0]);
+            let sharpened = new cv.Mat();
+            cv.filter2D(blurred, sharpened, -1, kernel);
+
+            // Chuyển về 8-bit
+            let resultU8 = new cv.Mat();
+            sharpened.convertTo(resultU8, cv.CV_8U);
+
+            const outCanvas = document.createElement("canvas");
+            outCanvas.width = plateCanvas.width;
+            outCanvas.height = plateCanvas.height;
+            cv.imshow(outCanvas, resultU8);
+
+            src.delete(); gray.delete(); equalized.delete();
+            blurred.delete(); kernel.delete(); sharpened.delete(); resultU8.delete();
+
+            resolve(outCanvas);
+        } catch (err) {
+            log("Contrast enhancement error: " + err.message, true);
+            resolve(plateCanvas);
+        }
+    });
+}
+
+// ==================== OCR Full biển số ====================
 function preprocessPlateForOCR(canvas) {
-    // Target height = 48 (PPOCRv3 rec thường dùng 48)
     const targetH = 48;
     const ratio = canvas.width / canvas.height;
     let targetW = Math.floor(targetH * ratio);
-    // Giới hạn chiều rộng tối đa 320 để tránh tensor quá lớn
-    targetW = Math.min(320, targetW);
-    if (targetW < 1) targetW = 1;
+    targetW = Math.min(320, Math.max(1, targetW));
 
     const temp = document.createElement("canvas");
     temp.width = targetW;
     temp.height = targetH;
     const tctx = temp.getContext("2d");
 
-    // Nền đen (có thể thay bằng padding giữ tỷ lệ)
     tctx.fillStyle = "black";
     tctx.fillRect(0, 0, targetW, targetH);
-    // Vẽ ảnh crop vào giữa (giữ tỷ lệ)
-    const drawW = targetW;
-    const drawH = targetH;
-    tctx.drawImage(canvas, 0, 0, drawW, drawH);
+    tctx.drawImage(canvas, 0, 0, targetW, targetH);
 
     const imgData = tctx.getImageData(0, 0, targetW, targetH).data;
     const input = new Float32Array(3 * targetW * targetH);
     for (let i = 0; i < targetW * targetH; i++) {
-        input[i] = imgData[i*4] / 255.0;         // R
-        input[i + targetW*targetH] = imgData[i*4+1] / 255.0; // G
-        input[i + 2*targetW*targetH] = imgData[i*4+2] / 255.0; // B
+        input[i] = imgData[i*4] / 255.0;
+        input[i + targetW*targetH] = imgData[i*4+1] / 255.0;
+        input[i + 2*targetW*targetH] = imgData[i*4+2] / 255.0;
     }
     return new ort.Tensor("float32", input, [1, 3, targetH, targetW]);
 }
 
-// Hàm reshape CRNN output (giữ nguyên từ code cũ, dùng cho OCR)
 function reshapeCRNNOutput(output) {
     const dims = output.dims;
     const data = output.data;
     let T, C, logits = [];
     if (dims[1] > dims[2]) {
         C = dims[1]; T = dims[2];
-        for (let t=0; t<T; t++) {
+        for (let t = 0; t < T; t++) {
             let row = [];
-            for (let c=0; c<C; c++) row.push(data[c*T + t]);
+            for (let c = 0; c < C; c++) row.push(data[c*T + t]);
             logits.push(row);
         }
     } else {
         T = dims[1]; C = dims[2];
-        for (let t=0; t<T; t++) {
+        for (let t = 0; t < T; t++) {
             let row = [];
-            for (let c=0; c<C; c++) row.push(data[t*C + c]);
+            for (let c = 0; c < C; c++) row.push(data[t*C + c]);
             logits.push(row);
         }
     }
@@ -282,12 +449,12 @@ function reshapeCRNNOutput(output) {
 }
 
 function ctcGreedyDecode(logits2D, blankIdx) {
-    if (!logits2D.length) return "";
+    if (!logits2D.length) return [];
     let prevIdx = blankIdx;
     let result = [];
-    for (let t=0; t<logits2D.length; t++) {
+    for (let t = 0; t < logits2D.length; t++) {
         let maxIdx = 0, maxVal = logits2D[t][0];
-        for (let c=1; c<logits2D[t].length; c++) {
+        for (let c = 1; c < logits2D[t].length; c++) {
             if (logits2D[t][c] > maxVal) { maxVal = logits2D[t][c]; maxIdx = c; }
         }
         if (maxIdx !== blankIdx && maxIdx !== prevIdx) result.push(maxIdx);
@@ -304,47 +471,61 @@ function decodeTextFromIndices(indices, charset) {
     return text;
 }
 
-// Hàm fix biển số Việt Nam theo quy tắc thực tế
-function fixPlateVN(text) {
-    // Thay thế các ký tự dễ nhầm
+// Định dạng biển số Việt Nam (chuẩn)
+function formatVietnamPlate(raw) {
+    // Thay thế ký tự dễ nhầm
+    let text = raw.toUpperCase();
     text = text.replace(/O/g, "0");
     text = text.replace(/I/g, "1");
     text = text.replace(/B/g, "8");
-    // Loại bỏ ký tự đặc biệt, chỉ giữ A-Z0-9
+    text = text.replace(/Q/g, "0");
+    text = text.replace(/S/g, "5");
+    text = text.replace(/Z/g, "2");
     text = text.replace(/[^A-Z0-9]/g, '');
-    // Format: 2 số + chữ + 4-5 số
-    const match = text.match(/^(\d{2})([A-Z])(\d{4,5})$/);
+
+    // Pattern: 2 số + (1-2 chữ) + (4-5 số)
+    let match = text.match(/^(\d{2})([A-Z]{1,2})(\d{4,5})$/);
     if (match) {
-        let [, p, l, n] = match;
-        // Nếu 5 số thì tách 3 và 2, nếu 4 số thì tách 2 và 2 (hoặc 3.1 tùy) - theo chuẩn hay dùng 3.2
-        if (n.length === 5) {
-            return `${p}${l}-${n.slice(0,3)}.${n.slice(3)}`;
-        } else if (n.length === 4) {
-            return `${p}${l}-${n.slice(0,2)}.${n.slice(2)}`;
+        let province = match[1];
+        let letters = match[2];
+        let numbers = match[3];
+        if (numbers.length === 5) {
+            return `${province}${letters}-${numbers.slice(0,3)}.${numbers.slice(3)}`;
+        } else if (numbers.length === 4) {
+            return `${province}${letters}-${numbers}`;
         }
-        return `${p}${l}-${n}`;
     }
+    // Nếu có 2 chữ cái và 4 số thì cũng format
+    match = text.match(/^(\d{2})([A-Z]{2})(\d{4})$/);
+    if (match) {
+        return `${match[1]}${match[2]}-${match[3]}`;
+    }
+    // Trường hợp 1 chữ cái và 5 số
+    match = text.match(/^(\d{2})([A-Z])(\d{5})$/);
+    if (match) {
+        let nums = match[3];
+        return `${match[1]}${match[2]}-${nums.slice(0,3)}.${nums.slice(3)}`;
+    }
+    // Không khớp thì trả về chuỗi đã lọc
     return text;
 }
 
 async function recognizePlateFull(plateCanvas) {
     try {
-        // Tiền xử lý ảnh biển số
-        const inputTensor = preprocessPlateForOCR(plateCanvas);
-        // Chạy OCR recognition model
+        // 1. Tăng cường độ tương phản
+        const enhanced = await enhancePlateContrast(plateCanvas);
+        // 2. Preprocess cho OCR
+        const inputTensor = preprocessPlateForOCR(enhanced);
+        // 3. Chạy model recognition
         const results = await sessionOCR.run({ [sessionOCR.inputNames[0]]: inputTensor });
         const output = results[sessionOCR.outputNames[0]];
         const logits2D = reshapeCRNNOutput(output);
-        const indices = ctcGreedyDecode(logits2D, 0); // blank index = 0
-        // Bộ charset của model PPOCRv3 (thường là 36 ký tự: digits + uppercase, không có blank)
-        // Ở đây ta dùng CHARSET gốc từ code cũ (đã khớp với model)
+        const indices = ctcGreedyDecode(logits2D, 0);
         const CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let rawText = decodeTextFromIndices(indices, CHARSET);
-        rawText = rawText.toUpperCase();
-        rawText = rawText.replace(/[^A-Z0-9]/g, '');
-        // Áp dụng fix cho biển số Việt Nam
-        const fixed = fixPlateVN(rawText);
-        return fixed;
+        // 4. Format lại theo biển số VN
+        const formatted = formatVietnamPlate(rawText);
+        return formatted;
     } catch (err) {
         log("OCR error: " + err.message, true);
         return "";
@@ -357,7 +538,6 @@ function drawResults(plateBoxes, recognizedText) {
     canvas.height = video.videoHeight;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    // Vẽ box biển số
     ctx.strokeStyle = "#00ff9c";
     ctx.lineWidth = 3;
     for (const box of plateBoxes) {
@@ -376,13 +556,12 @@ function drawResults(plateBoxes, recognizedText) {
     }
 }
 
-// ==================== Luồng chính detect (đã sửa) ====================
+// ==================== Luồng chính detect ====================
 async function detect() {
     if (!isModelReady || isProcessing) return;
     if (!video.videoWidth) return;
     isProcessing = true;
     try {
-        // 1. Detect plate with YOLO
         const { tensor, dx, dy, scale } = preprocessImage(video, video.videoWidth, video.videoHeight, INPUT_SIZE, INPUT_SIZE);
         const plateResults = await sessionPlate.run({ [sessionPlate.inputNames[0]]: tensor });
         const outputPlate = plateResults[sessionPlate.outputNames[0]];
@@ -393,8 +572,8 @@ async function detect() {
         let recognizedPlateText = "";
         if (plateBoxes.length) {
             const bestPlate = plateBoxes.reduce((a,b) => a.score > b.score ? a : b);
-            // Crop biển số từ video (có thể thêm padding 10-15% để tránh mất ký tự)
-            const padRatio = 0.12; // 12% padding
+            // Thêm padding 12% để tránh mất ký tự
+            const padRatio = 0.12;
             const padX = (bestPlate.x2 - bestPlate.x1) * padRatio;
             const padY = (bestPlate.y2 - bestPlate.y1) * padRatio;
             const cropX1 = Math.max(0, bestPlate.x1 - padX);
@@ -407,10 +586,9 @@ async function detect() {
             const pctx = plateCanvas.getContext("2d");
             pctx.drawImage(video, cropX1, cropY1, plateCanvas.width, plateCanvas.height, 0, 0, plateCanvas.width, plateCanvas.height);
             
-            // Gọi OCR full biển số thay vì CRAFT + CRNN từng ký tự
             recognizedPlateText = await recognizePlateFull(plateCanvas);
-            if (recognizedPlateText) finalText = `🔢 ${recognizedPlateText}`;
-            else finalText = `⚠️ Biển số (${Math.round(bestPlate.score*100)}%) nhưng không đọc được ký tự`;
+            if (recognizedPlateText && recognizedPlateText.length >= 5) finalText = `🔢 ${recognizedPlateText}`;
+            else finalText = `⚠️ Biển số (${Math.round(bestPlate.score*100)}%) không đọc được`;
         }
         resultTextDiv.innerText = finalText;
         drawResults(plateBoxes, recognizedPlateText);
@@ -433,6 +611,12 @@ function detectLoop(now) {
     animationId = requestAnimationFrame(detectLoop);
 }
 
+function startDetectionLoop() {
+    if (animationId) cancelAnimationFrame(animationId);
+    lastTimestamp = 0;
+    animationId = requestAnimationFrame(detectLoop);
+}
+
 // ==================== Khởi tạo ====================
 startBtn.addEventListener("click", async () => {
     if (startBtn.disabled) return;
@@ -446,11 +630,10 @@ startBtn.addEventListener("click", async () => {
         sessionPlate = await loadModel(PLATE_MODEL_PATH);
         log("⏳ Tải model OCR recognition...");
         sessionOCR = await loadModel(OCR_REC_PATH);
-        log("⏳ Tải model orientation classifier (optional)...");
+        log("⏳ Tải model orientation classifier...");
         sessionCLS = await loadModel(OCR_CLS_PATH);
         isModelReady = true;
         initPreprocess();
-        // Chờ video ready
         let attempts = 0;
         const waitVideo = setInterval(() => {
             if (video.videoWidth > 0) {
@@ -473,9 +656,6 @@ startBtn.addEventListener("click", async () => {
         resultTextDiv.innerText = "⚠️ Lỗi, thử lại";
     }
 });
-
-function startDetectionLoop() {
-    if (animationId) cancelAnimationFrame(animationId);
-    lastTimestamp = 0;
-    animationId = requestAnimationFrame(detectLoop);
-}
+</script>
+</body>
+</html>
